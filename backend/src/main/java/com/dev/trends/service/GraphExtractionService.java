@@ -72,6 +72,15 @@ public class GraphExtractionService {
      */
     private static final int MAX_PROMPT_ARTICLES = 120;
 
+    /**
+     * Output budget of the extraction call. gpt-oss is a reasoning model, so this
+     * budget covers the hidden reasoning AND the JSON. Raising it is capped by
+     * Groq's 8000 tokens/minute free tier (input + max_tokens are reserved
+     * together); the prompt keeps the JSON small instead (node/edge caps, compact
+     * output) so it fits.
+     */
+    private static final int EXTRACTION_MAX_TOKENS = 4000;
+
     private final HttpClient httpClient;
     private final ObjectMapper objectMapper;
     private final NodeRepository nodeRepository;
@@ -421,8 +430,10 @@ public class GraphExtractionService {
                     // Output + input must fit inside Groq's 8000 tokens/minute free tier,
                     // which counts both against the same limit (413 rate_limit_exceeded when
                     // exceeded). With ~2.7k of input this keeps the request at ~6.7k.
-                    "max_tokens", 4000,
+                    "max_tokens", EXTRACTION_MAX_TOKENS,
                     "reasoning_effort", "low",
+                    // JSON mode: the content is a bare JSON object, no prose or markdown fences.
+                    "response_format", Map.of("type", "json_object"),
                     "messages", List.of(
                             Map.of("role", "system", "content", systemPrompt),
                             Map.of("role", "user", "content", userMessage)
@@ -448,7 +459,18 @@ public class GraphExtractionService {
             }
 
             JsonNode root = objectMapper.readTree(llmResp.body());
-            String content = root.path("choices").get(0).path("message").path("content").asText("");
+            JsonNode choice = root.path("choices").get(0);
+            String content = choice.path("message").path("content").asText("");
+
+            // The output budget ran out (in the reasoning or mid-JSON): whatever came
+            // back is cut off. Report it as such instead of as a generic parse error.
+            if ("length".equals(choice.path("finish_reason").asText())) {
+                log.error("LLM {} hit max_tokens={} ({} chars of content)", model,
+                        EXTRACTION_MAX_TOKENS, content.length());
+                return new LlmCallResult(null, "LLM output truncated at max_tokens="
+                        + EXTRACTION_MAX_TOKENS + " (finish_reason=length) from " + model);
+            }
+
             content = content.replaceAll("```json", "").replaceAll("```", "").trim();
             log.info("Resposta bruta do LLM {} ({} chars): {}", model, content.length(),
                     content.length() > 200 ? content.substring(0, 200) + "..." : content);
@@ -476,7 +498,7 @@ public class GraphExtractionService {
         return sample;
     }
 
-    private ExtractionResult callLlmForExtraction(List<Article> articles) {
+    ExtractionResult callLlmForExtraction(List<Article> articles) {
         if (llmApiKey == null || llmApiKey.isBlank()) {
             log.warn("LLM API key not configured. Falling back to keyword extraction.");
             return extractByKeyword(articles, "GROQ_API_KEY missing from service configuration");
@@ -507,6 +529,8 @@ public class GraphExtractionService {
                    curiosidades, cultura pop) — o Hacker News publica isso na home. IGNORE essas
                    matérias por completo. Só entram no grafo ferramentas, linguagens, frameworks,
                    modelos e conceitos de engenharia de software e IA. Na dúvida, deixe de fora.
+                4. No máximo 40 nós e 40 arestas — fique só com os mais relevantes.
+                5. JSON compacto, em uma única linha, sem indentação nem quebras de linha.
 
                 Responda APENAS com JSON válido no formato:
                 {
@@ -532,7 +556,13 @@ public class GraphExtractionService {
             return extractByKeyword(articles, error);
         }
 
-        return parseLlmResponse(llmCall.content(), articles);
+        // An unparseable answer still gets the keyword fallback, so the run never
+        // ends with an empty graph just because the JSON was malformed.
+        ExtractionResult parsed = parseLlmResponse(llmCall.content(), articles);
+        if (parsed.llmError() != null) {
+            return extractByKeyword(articles, parsed.llmError());
+        }
+        return parsed;
     }
 
     /**
