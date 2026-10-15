@@ -40,6 +40,9 @@ test("skip-link is reachable via Tab and jumps to main", async ({ page }) => {
 
 test("slash focuses the search input", async ({ page }) => {
   await page.goto("/");
+  // GraphView is client-only, so its keydown listener attaches after "load".
+  // Wait for the graph to render, or a slow runner presses "/" too early.
+  await expect(page.getByText("LangGraph").first()).toBeVisible();
   await page.keyboard.press("/");
   const search = page.getByRole("textbox", { name: /search technology/i });
   await expect(search).toBeFocused();
